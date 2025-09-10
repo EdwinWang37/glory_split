@@ -268,8 +268,8 @@ def main():
         print("没有生成任何向量")
         return
     
-    # 6. 创建t-SNE和PCA对比可视化
-    create_tsne_pca_visualization(vectors, labels, user_info)
+    # 6. 创建t-SNE可视化
+    vectors_2d = create_tsne_visualization(vectors, labels, user_info)
     
     print("\n=== 完成 ===")
     print(f"总共处理了 {len(vectors)} 个新闻向量")
