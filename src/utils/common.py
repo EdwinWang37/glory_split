@@ -16,11 +16,28 @@ from omegaconf import DictConfig, ListConfig
 
 
 def seed_everything(seed):
+    '''
+     分别对CPU,GPU上的操作以及numpy上的操作进行固定
+    '''
+    # 设置 PyTorch 的随机种子，影响 CPU 上的所有操作
     torch.manual_seed(seed)
+
+    # 设置所有 GPU 上的随机种子，影响 CUDA 操作
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
+
+    # 设置 CUDNN（NVIDIA GPU 深度学习库）为确定性模式，保证每次运行相同的结果
+    # 这样设置可以使得卷积操作的结果具有可重复性
+    torch.backends.cudnn.deterministic = True #backend是命名空间，表示与硬件有关的后端的各种设置，backend模块中有很多子模块，分别对应不同的计算后端
+
+    # 设置 CUDNN 的自动优化关闭，使得每次运行时都使用相同的算法（以确保可重复性）
+    # 设置为 False 会启用自动选择最快的卷积算法，但可能导致不同的结果
     torch.backends.cudnn.benchmark = False
+
+    # 设置 Python 自带的 random 模块的种子，用于生成随机数的部分
+    # 例如，random.shuffle()、random.choice() 等会受到影响
     random.seed(seed)
+
+    # 设置 numpy 的随机种子，影响 numpy 中的随机操作，例如 np.random.rand()
     np.random.seed(seed)
 
 def load_model(cfg):

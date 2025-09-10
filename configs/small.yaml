@@ -5,7 +5,7 @@
 defaults:
   - default
   - override dataset: MINDsmall
-  - override model: GLORY
+  - override model: GLORYSplit
   - _self_
 
 optimizer:
@@ -34,7 +34,7 @@ model:
   
 
 logger:
-  exp_name: GLORY
+  exp_name: GLORYSplit
   run_name: ${model.model_name}_${dataset.dataset_name}_${model.k_hops}-${model.num_neighbors}-${model.entity_neighbors}
 
 ml_label: default

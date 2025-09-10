@@ -1,4 +1,4 @@
-his_size: 50  # Number of sampled click history for each user
+his_size: 50 # Number of sampled click history for each user
 title_size: 30
 abstract_size: 50
 word_freq_threshold: 1
