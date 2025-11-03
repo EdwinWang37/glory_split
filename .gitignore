@@ -17,4 +17,6 @@ checkpoint/
 outputs/
 pred/
 mlruns/
-train/
+train/.pytest_cache/
+.coverage
+htmlcov/
