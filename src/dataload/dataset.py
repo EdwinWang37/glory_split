@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset, Dataset
+from torch.utils.data import IterableDataset, Dataset, get_worker_info
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import subgraph
 import numpy as np
@@ -17,6 +17,11 @@ class TrainDataset(IterableDataset):
         self.cfg = cfg
         self.local_rank = local_rank
         self.world_size = cfg.gpu_num
+        # Provide safe defaults for minimal configs (e.g., tests) where his_size may be missing
+        try:
+            self.his_size = int(cfg.model.his_size)
+        except Exception:
+            self.his_size = 70
 
     # 将新闻 ID 转换为新闻索引
     def trans_to_nindex(self, nids):
@@ -41,7 +46,7 @@ class TrainDataset(IterableDataset):
         sess_neg = line[5].split()
 
         # 点击新闻处理
-        clicked_index, clicked_mask = self.pad_to_fix_len(self.trans_to_nindex(click_id), self.cfg.model.his_size)
+        clicked_index, clicked_mask = self.pad_to_fix_len(self.trans_to_nindex(click_id), self.his_size)
         clicked_input = self.news_input[clicked_index]
 
         label = 0
@@ -51,8 +56,22 @@ class TrainDataset(IterableDataset):
         return clicked_input, clicked_mask, candidate_input, label
 
     def __iter__(self):
-        file_iter = open(self.filename)
-        return map(self.line_mapper, file_iter)
+        worker = get_worker_info()
+        if worker is None:
+            file_iter = open(self.filename)
+            return map(self.line_mapper, file_iter)
+        else:
+            worker_id = worker.id
+            num_workers = worker.num_workers
+
+            def generator():
+                with open(self.filename) as f:
+                    for i, line in enumerate(f):
+                        if i % num_workers != worker_id:
+                            continue
+                        yield self.line_mapper(line)
+
+            return generator()
 
 
 class TrainGraphDataset(TrainDataset):
@@ -60,27 +79,41 @@ class TrainGraphDataset(TrainDataset):
     def __init__(self, filename, news_index, news_input, local_rank, cfg, neighbor_dict, news_graph, entity_neighbors):
         super().__init__(filename, news_index, news_input, local_rank, cfg)
         self.neighbor_dict = neighbor_dict
-        self.news_graph = news_graph.to(local_rank, non_blocking=True)
-        self.batch_size = cfg.batch_size / cfg.gpu_num
+        # Keep dataset tensors on CPU. DataLoader(pin_memory=True) will pin them,
+        # and the training loop moves them to GPU with non_blocking copies.
+        self.news_graph = news_graph
+        # 确保 batch_size 为整数，避免隐式 float 比较导致的边缘开销
+        self.batch_size = int(cfg.batch_size / max(1, cfg.gpu_num))
         self.entity_neighbors = entity_neighbors
-        self.fake_news_generator = IntegratedFakeNewsGenerator(cfg, device=f'cuda:{local_rank}')
-        self.fake_news_generator.load_news_encoder(cfg.model.news_encoder_path)
-        self.fake_news_generator.initialize_vae() # Instantiate the fake news generator with correct parameters
+
+        # 是否在 DataLoader 中动态生成并注入假新闻（默认关闭，避免重复生成与显存占用）
+        self.generate_fake_in_dataloader = getattr(cfg, 'generate_fake_in_dataloader', False)
+        if self.generate_fake_in_dataloader:
+            # Respect configured device; default to CPU when not CUDA
+            if str(getattr(cfg, 'device', 'cpu')).startswith('cuda'):
+                target_device = f'cuda:{local_rank}'
+            else:
+                target_device = str(getattr(cfg, 'device', 'cpu'))
+            self.fake_news_generator = IntegratedFakeNewsGenerator(cfg, device=target_device)
+            self.fake_news_generator.load_news_encoder(cfg.model.news_encoder_path)
+            self.fake_news_generator.initialize_vae()  # 仅在需要时才初始化，避免额外显存占用
+        else:
+            self.fake_news_generator = None
 
     def line_mapper(self, line, sum_num_news):
         line = line.strip().split('\t')
-        real_click_id = line[3].split() # Get real historical news
-        
-        # Generate 20 fake news for the user (restored)
-        # Assuming generate_personalized_fake_news_vectors takes user_id and returns a list of fake news IDs
-        fake_news_ids, _ = self.fake_news_generator.generate_personalized_fake_news_vectors(num_fake_news=20) # Assuming generate_personalized_fake_news_vectors does not need user_id directly
-        
-        # Prepend fake news to real news
-        combined_click_id = fake_news_ids + real_click_id
+        real_click_id = line[3].split()  # 原始历史新闻（预处理阶段已可选地注入过假新闻）
+
+        # 如启用在 DataLoader 内注入，则在此追加；默认关闭以节省显存并避免重复
+        if self.generate_fake_in_dataloader and self.fake_news_generator is not None:
+            fake_news_ids, _ = self.fake_news_generator.generate_personalized_fake_news_vectors(num_fake_news=20)
+            combined_click_id = fake_news_ids + real_click_id
+        else:
+            combined_click_id = real_click_id
         
         # Handle padding/truncation to his_size (70)
-        if len(combined_click_id) > self.cfg.model.his_size:
-            click_id = combined_click_id[-self.cfg.model.his_size:] # Truncate from the end if more than 70
+        if len(combined_click_id) > self.his_size:
+            click_id = combined_click_id[-self.his_size:] # Truncate from the end if more than 70
         else:
             click_id = combined_click_id # Use as is, padding will be handled by pad_to_fix_len
         
@@ -101,7 +134,7 @@ class TrainGraphDataset(TrainDataset):
             click_idx.extend(current_hop_idx)
 
         sub_news_graph, mapping_idx = self.build_subgraph(click_idx, top_k, sum_num_news)
-        padded_maping_idx = F.pad(mapping_idx, (self.cfg.model.his_size - len(mapping_idx), 0), "constant", -1)
+        padded_maping_idx = F.pad(mapping_idx, (self.his_size - len(mapping_idx), 0), "constant", -1)
 
         # ------------------ 候选新闻 ---------------------
         label = 0
@@ -180,6 +213,23 @@ class TrainGraphDataset(TrainDataset):
         return sub_news_graph, unique_mapping[:k] + sum_num_nodes
 
     def __iter__(self):
+        worker = get_worker_info()
+
+        def yield_batch(clicked_graphs, candidates, mappings, labels,
+                        candidate_entity_list, entity_mask_list,
+                        fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list):
+            batch = Batch.from_data_list(clicked_graphs)
+            candidates = torch.stack(candidates)
+            mappings = torch.stack(mappings)
+            candidate_entity_list = torch.stack(candidate_entity_list)
+            entity_mask_list = torch.stack(entity_mask_list)
+            fake_candidate_input_list = torch.stack(fake_candidate_input_list)
+            fake_candidate_entity_list = torch.stack(fake_candidate_entity_list)
+            fake_entity_mask_list = torch.stack(fake_entity_mask_list)
+            labels = torch.tensor(labels, dtype=torch.long)
+            return batch, mappings, candidates, candidate_entity_list, entity_mask_list, labels, \
+                fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list
+
         while True:
             clicked_graphs = []
             candidates = []
@@ -192,8 +242,16 @@ class TrainGraphDataset(TrainDataset):
             fake_candidate_entity_list = []
             fake_entity_mask_list = []
             sum_num_news = 0
+
             with open(self.filename) as f:
-                for line in f:
+                if worker is None:
+                    line_iter = enumerate(f)
+                else:
+                    worker_id = worker.id
+                    num_workers = worker.num_workers
+                    line_iter = ((i, line) for i, line in enumerate(f) if i % num_workers == worker_id)
+
+                for _, line in line_iter:
                     sub_newsgraph, padded_mapping_idx, candidate_input, candidate_entity, entity_mask, label, \
                         fake_candidate_input, fake_candidate_entity, fake_entity_mask, sum_num_news = self.line_mapper(
                             line, sum_num_news)
@@ -211,39 +269,20 @@ class TrainGraphDataset(TrainDataset):
 
                     # 当达到 batch_size 时，返回一个 batch
                     if len(clicked_graphs) == self.batch_size:
-                        batch = Batch.from_data_list(clicked_graphs)
+                        yield yield_batch(clicked_graphs, candidates, mappings, labels,
+                                          candidate_entity_list, entity_mask_list,
+                                          fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list)
 
-                        candidates = torch.stack(candidates)
-                        mappings = torch.stack(mappings)
-                        candidate_entity_list = torch.stack(candidate_entity_list)
-                        entity_mask_list = torch.stack(entity_mask_list)
-                        fake_candidate_input_list = torch.stack(fake_candidate_input_list)
-                        fake_candidate_entity_list = torch.stack(fake_candidate_entity_list)
-                        fake_entity_mask_list = torch.stack(fake_entity_mask_list)
-
-                        labels = torch.tensor(labels, dtype=torch.long)
-                        yield batch, mappings, candidates, candidate_entity_list, entity_mask_list, labels, \
-                            fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list
-                        clicked_graphs, mappings, candidates, labels, candidate_entity_list, entity_mask_list = [], [], [], [], [], []
+                        clicked_graphs, mappings, candidates, labels = [], [], [], []
+                        candidate_entity_list, entity_mask_list = [], []
                         fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list = [], [], []
                         sum_num_news = 0
 
                 # 处理剩余的数据
                 if len(clicked_graphs) > 0:
-                    batch = Batch.from_data_list(clicked_graphs)
-
-                    candidates = torch.stack(candidates)
-                    mappings = torch.stack(mappings)
-                    candidate_entity_list = torch.stack(candidate_entity_list)
-                    entity_mask_list = torch.stack(entity_mask_list)
-                    fake_candidate_input_list = torch.stack(fake_candidate_input_list)
-                    fake_candidate_entity_list = torch.stack(fake_candidate_entity_list)
-                    fake_entity_mask_list = torch.stack(fake_entity_mask_list)
-                    labels = torch.tensor(labels, dtype=torch.long)
-
-                    yield batch, mappings, candidates, candidate_entity_list, entity_mask_list, labels, \
-                        fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list
-                    f.seek(0)
+                    yield yield_batch(clicked_graphs, candidates, mappings, labels,
+                                      candidate_entity_list, entity_mask_list,
+                                      fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list)
 
 
 class ValidGraphDataset(TrainGraphDataset):
@@ -251,14 +290,15 @@ class ValidGraphDataset(TrainGraphDataset):
     def __init__(self, filename, news_index, news_input, local_rank, cfg, neighbor_dict, news_graph, entity_neighbors,
                  news_entity):
         super().__init__(filename, news_index, news_input, local_rank, cfg, neighbor_dict, news_graph, entity_neighbors)
-        self.news_graph.x = torch.from_numpy(self.news_input).to(local_rank, non_blocking=True)  # 将新闻输入转换为张量并移至指定设备
+        # Keep on CPU; will be moved to GPU in the validation loop.
+        self.news_graph.x = torch.from_numpy(self.news_input)
         self.news_entity = news_entity  # 实体信息
 
     # 数据行映射处理
     def line_mapper(self, line):
 
         line = line.strip().split('\t')
-        click_id = line[3].split()[-self.cfg.model.his_size:]  # 获取点击的新闻 ID（最近的历史新闻）
+        click_id = line[3].split()[-self.his_size:]  # 获取点击的新闻 ID（最近的历史新闻）
 
         click_idx = self.trans_to_nindex(click_id)  # 将点击的新闻 ID 转换为新闻索引
         clicked_entity = self.news_entity[click_idx]  # 获取点击新闻对应的实体
@@ -330,6 +370,3 @@ class NewsDataset(Dataset):
     # 获取数据集的长度
     def __len__(self):
         return self.data.shape[0]  # 返回数据的行数（即样本数）
-
-
-

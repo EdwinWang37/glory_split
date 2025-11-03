@@ -64,9 +64,10 @@ def load_model(cfg):
 def save_model(cfg, model, optimizer=None, mark=None):
     file_path = Path(f"{cfg.path.ckp_dir}/{cfg.model.model_name}_{cfg.dataset.dataset_name}_{mark}.pth")
     file_path.parent.mkdir(parents=True, exist_ok=True)
+    state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
     torch.save(
         {
-            'model_state_dict': model.module.state_dict(),
+            'model_state_dict': state_dict,
             'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
         },
         file_path)
@@ -98,10 +99,18 @@ def load_pretrain_emb(embedding_file_path, target_dict, target_dim):
 
 
 def reduce_mean(result, nprocs):
+    """All-reduce mean when distributed; fallback to identity otherwise."""
     rt = result.detach()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    rt /= nprocs
-    return rt
+    try:
+        if nprocs > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+            rt /= nprocs
+            return rt
+        else:
+            return rt
+    except Exception:
+        # Safe fallback when dist is not initialized
+        return rt
 
 
 def pretty_print(d, indent=0):

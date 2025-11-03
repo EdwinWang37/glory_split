@@ -59,7 +59,21 @@ def prepare_distributed_data_with_fake_news(cfg, mode="train"):
     """
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
 
-    device = torch.device(cfg.device if torch.cuda.is_available() and cfg.device else "cpu")
+    # Choose device with CUDA/MPS/CPU fallback for macOS compatibility
+    if getattr(cfg, 'device', None):
+        # Respect explicit config when possible
+        wanted = str(cfg.device)
+        if wanted.startswith('cuda') and torch.cuda.is_available():
+            device = torch.device(wanted)
+        elif wanted.startswith('mps') and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
+    else:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else (
+                'mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu')
+        )
     fake_news_generator = IntegratedFakeNewsGenerator(cfg, device=device)
 
     fake_news_generator.load_news_encoder(cfg.model.news_encoder_path)
@@ -744,4 +758,3 @@ def prepare_preprocessed_data(cfg):
     # 合并训练集、验证集和测试集的实体嵌入向量
     os.system("cat " + f"{train_entity_emb_path} {val_entity_emb_path}" + f" > {val_combined_path}")
     os.system("cat " + f"{train_entity_emb_path} {test_entity_emb_path}" + f" > {test_combined_path}")
-

@@ -77,13 +77,29 @@ class GLORYClient(nn.Module):
         # --------------------------------------------1--------------------------------------------
         # ----------------------------------------- 处理候选新闻 ------------------------------------
         # 对候选新闻进行编码
-        cand_title_emb = self.local_news_encoder(candidate_news)  # 编码候选新闻标题
+        # 支持两种输入：
+        # 1) 训练时传入原始 token（[B, N, total_input]）-> 需要编码
+        # 2) 验证时传入已编码的向量（[N, news_dim] 或 [1, N, news_dim]）-> 直接使用
+        if candidate_news.dim() == 2 and candidate_news.shape[-1] == self.news_dim and torch.is_floating_point(candidate_news):
+            cand_title_emb = candidate_news.unsqueeze(0)
+        elif candidate_news.dim() == 3 and candidate_news.shape[-1] == self.news_dim and torch.is_floating_point(candidate_news):
+            cand_title_emb = candidate_news
+        else:
+            cand_title_emb = self.local_news_encoder(candidate_news)  # 编码候选新闻标题
         if self.use_entity:
             # 分离候选新闻的原始实体和邻居实体
             origin_entity, neighbor_entity = candidate_entity.split(
                 [self.cfg.model.entity_size, self.cfg.model.entity_size * self.cfg.model.entity_neighbors], dim=-1)
 
             # 对候选新闻的实体进行编码
+            # 兼容验证阶段 [N, ...] 的形状，补齐 batch 维度
+            if origin_entity.dim() == 2:
+                origin_entity = origin_entity.unsqueeze(0)
+            if neighbor_entity.dim() == 2:
+                neighbor_entity = neighbor_entity.unsqueeze(0)
+            if entity_mask is not None and entity_mask.dim() == 2:
+                entity_mask = entity_mask.unsqueeze(0)
+
             cand_origin_entity_emb = self.local_entity_encoder(origin_entity, None)
             cand_neighbor_entity_emb = self.global_entity_encoder(neighbor_entity, entity_mask)
 
@@ -95,11 +111,35 @@ class GLORYClient(nn.Module):
         score = self.click_predictor(cand_final_emb, user_emb)
         return score
 
-    def process_news(self, subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask):
+    def process_news(self, subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask, clicked_entity_input=None):
         # 处理新闻的编码过程
+        # 兼容 DataLoader 在验证阶段返回的一维 mapping_idx
+        if mapping_idx.dim() == 1:
+            mapping_idx = mapping_idx.unsqueeze(0)
         mask = mapping_idx != -1
+        mapping_idx = mapping_idx.clone()  # 避免原地修改上游变量
         mapping_idx[mapping_idx == -1] = 0
-        batch_size, num_clicked, token_dim = mapping_idx.shape[0], mapping_idx.shape[1], candidate_news.shape[-1]
+        batch_size, num_clicked = mapping_idx.shape[0], mapping_idx.shape[1]
+        token_dim = candidate_news.shape[-1]
+
+        # 如果 subgraph.x 已经是编码后的向量（验证阶段），则跳过本地编码器
+        x_feat = subgraph.x
+        if torch.is_floating_point(x_feat) and x_feat.shape[-1] == self.news_dim:
+            x_encoded = x_feat
+            if self.use_entity:
+                # 验证阶段使用数据集中提供的实体索引
+                if clicked_entity_input is not None:
+                    ce = clicked_entity_input
+                    if ce.dim() == 2:
+                        ce = ce.unsqueeze(0)
+                    clicked_entity = self.local_entity_encoder(ce, None)
+                else:
+                    clicked_entity = None
+            else:
+                clicked_entity = None
+            return x_encoded, mask, mapping_idx, batch_size, num_clicked, clicked_entity
+
+        # 训练阶段：subgraph.x 仍为原始 token，需要编码
         clicked_entity = subgraph.x[mapping_idx, -8:-3]  # 获取点击新闻的实体信息
         x_flatten = subgraph.x.view(1, -1, token_dim)  # 展平
         x_encoded = self.local_news_encoder(x_flatten).view(-1, self.news_dim)  # 编码
@@ -141,11 +181,19 @@ class GLORYSplit(nn.Module):
     def validation_process(self, subgraph, mapping_idx, clicked_entity, candidate_news, candidate_entity, entity_mask):
         # 客户端计算 x_encoded 和其他特征 (现在用于 70 条历史新闻)
         x_encoded, mask, mapping_idx, batch_size, num_clicked, clicked_entity = self.client.process_news(
-            subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask)
+            subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask, clicked_entity_input=clicked_entity)
+
+        # Ensure tensors are on the same device as the model before GNN and masking
+        dev = next(self.parameters()).device
+        x_encoded = x_encoded.to(dev)
+        mapping_idx = mapping_idx.to(dev)
+        mask = mask.to(dev)
+        if clicked_entity is not None:
+            clicked_entity = clicked_entity.to(dev)
 
         clicked_origin_emb_70 = x_encoded[mapping_idx, :].masked_fill(~mask.unsqueeze(-1), 0).view(batch_size, num_clicked,
                                                                                                 self.client.news_dim)
-        graph_emb = self.server(x_encoded, subgraph.edge_index, mapping_idx)
+        graph_emb = self.server(x_encoded, subgraph.edge_index.to(dev), mapping_idx)
 
         clicked_graph_emb_70 = graph_emb[mapping_idx, :].masked_fill(~mask.unsqueeze(-1), 0).view(batch_size, num_clicked,
                                                                                                 self.client.news_dim)
@@ -187,12 +235,20 @@ class GLORYSplit(nn.Module):
         x_encoded, mask, mapping_idx, batch_size, num_clicked, clicked_entity = self.client.process_news(
             subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask) # num_clicked 将是 70
 
+        # Align devices for safety when running on different executors
+        dev = next(self.parameters()).device
+        x_encoded = x_encoded.to(dev)
+        mapping_idx = mapping_idx.to(dev)
+        mask = mask.to(dev)
+        if clicked_entity is not None:
+            clicked_entity = clicked_entity.to(dev)
+
         clicked_origin_emb_70 = x_encoded[mapping_idx, :].masked_fill(~mask.unsqueeze(-1), 0).view(batch_size, num_clicked,
                                                                                                 self.client.news_dim)
         # 加噪声
         #x_encoded = self.denoise(x_encoded)
         # 服务器端计算 clicked_graph_emb
-        graph_emb = self.server(x_encoded, subgraph.edge_index, mapping_idx)
+        graph_emb = self.server(x_encoded, subgraph.edge_index.to(dev), mapping_idx)
         # 去噪声
         #graph_emb = self.denoise(graph_emb)
 
@@ -223,4 +279,3 @@ class GLORYSplit(nn.Module):
         loss = self.compute_security_loss(score_real, score_fake_candidate, label)
 
         return loss, score_real, score_70_news
-

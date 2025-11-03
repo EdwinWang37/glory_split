@@ -11,7 +11,7 @@ import pickle
 from dataload.dataset import *  # 导入自定义数据集模块
 
 
-def load_data(cfg, mode='train', model=None, local_rank=0):
+def load_data(cfg, mode='train', model=None, local_rank=0, device=None):
     """
     加载训练、验证或测试数据。
 
@@ -66,7 +66,21 @@ def load_data(cfg, mode='train', model=None, local_rank=0):
                 news_graph=news_graph,
                 entity_neighbors=entity_neighbors
             )
-            dataloader = DataLoader(dataset, batch_size=None)  # 创建DataLoader
+            # 使用 pin_memory 以加速 CPU->GPU 传输（对于候选/实体张量）
+            # 并行化 IterableDataset：num_workers、persistent_workers、prefetch_factor
+            _nw = getattr(cfg, 'num_workers', 0)
+            _pf = getattr(cfg, 'prefetch_factor', 2)
+            if _nw and _nw > 0:
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=None,
+                    pin_memory=True,
+                    num_workers=_nw,
+                    persistent_workers=True,
+                    prefetch_factor=_pf,
+                )
+            else:
+                dataloader = DataLoader(dataset, batch_size=None, pin_memory=True)
 
         else:
             # 不使用图结构模型时，直接加载普通的训练数据集
@@ -79,28 +93,46 @@ def load_data(cfg, mode='train', model=None, local_rank=0):
             )
 
             # 创建DataLoader，按GPU数进行批量划分
-            dataloader = DataLoader(dataset,
-                                    batch_size=int(cfg.batch_size / cfg.gpu_num),
-                                    pin_memory=True)
+            _nw = getattr(cfg, 'num_workers', 0)
+            _pf = getattr(cfg, 'prefetch_factor', 2)
+            if _nw and _nw > 0:
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=int(cfg.batch_size / cfg.gpu_num),
+                    pin_memory=True,
+                    num_workers=_nw,
+                    persistent_workers=True,
+                    prefetch_factor=_pf,
+                )
+            else:
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=int(cfg.batch_size / cfg.gpu_num),
+                    pin_memory=True,
+                )
         return dataloader
     elif mode in ['val', 'test']:
         # 转换新闻数据为嵌入
         news_dataset = NewsDataset(news_input)
-        news_dataloader = DataLoader(news_dataset,
-                                     batch_size=int(cfg.batch_size * cfg.gpu_num),
-                                     num_workers=cfg.num_workers)
+        # 评估阶段对新闻编码可使用更大的 batch 提升吞吐
+        eval_bs = int(getattr(cfg, 'val_news_batch_size', cfg.batch_size * cfg.gpu_num))
+        news_dataloader = DataLoader(
+            news_dataset,
+            batch_size=eval_bs,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=True if getattr(cfg, 'num_workers', 0) and cfg.num_workers > 0 else False,
+        )
 
         stacked_news = []
-        with torch.no_grad():
+        # 推理阶段使用 inference_mode 进一步减少开销和显存占用
+        with torch.inference_mode():
             # 在验证和测试模式下，计算新闻的嵌入表示
             for news_batch in tqdm(news_dataloader, desc=f"[{local_rank}] Processing validation News Embedding"):
                 # 如果使用图模型，计算嵌入
-                if cfg.model.use_graph:
-                    batch_emb = model.module.client.local_news_encoder(news_batch.long().unsqueeze(0).to(local_rank)).squeeze(
-                        0).detach()
-                else:
-                    batch_emb = model.module.client.local_news_encoder(news_batch.long().unsqueeze(0).to(local_rank)).squeeze(
-                        0).detach()
+                dev = device if device is not None else local_rank
+                client = getattr(model, 'module', model).client
+                batch_emb = client.local_news_encoder(news_batch.long().unsqueeze(0).to(dev)).squeeze(0).detach()
                 stacked_news.append(batch_emb)
 
         # 拼接所有新闻的嵌入表示
