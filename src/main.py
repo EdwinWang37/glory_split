@@ -2,6 +2,8 @@ import os.path
 from pathlib import Path
 
 import hydra
+
+print("[DEBUG] main.py started.")
 #import wandb
 import numpy as np
 import torch
@@ -30,10 +32,11 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
     sum_loss = torch.zeros(1).to(local_rank)  # 存储累积损失
     sum_auc = torch.zeros(1).to(local_rank)  # 存储累积AUC（Area Under Curve）
     # 添加假新闻相关指标
-    sum_fake_acc = torch.zeros(1).to(local_rank)  # 存储假新闻准确率
+    sum_70_news_auc = torch.zeros(1).to(local_rank)  # 存储基于 70 条新闻的 AUC
     
     # 遍历数据集进行训练
-    for cnt, (subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask, labels) \
+    for cnt, (subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask, labels, \
+            fake_candidate_news, fake_candidate_entity, fake_entity_mask) \
             in enumerate(tqdm(dataloader,
                               total=int(cfg.num_epochs * (cfg.dataset.pos_count // cfg.batch_size + 1)),
                               desc=f"[{local_rank}] Training"), start=1):
@@ -45,13 +48,17 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
         labels = labels.to(local_rank, non_blocking=True)
         candidate_entity = candidate_entity.to(local_rank, non_blocking=True)
         entity_mask = entity_mask.to(local_rank, non_blocking=True)
+        fake_candidate_news = fake_candidate_news.to(local_rank, non_blocking=True)
+        fake_candidate_entity = fake_candidate_entity.to(local_rank, non_blocking=True)
+        fake_entity_mask = fake_entity_mask.to(local_rank, non_blocking=True)
 
         # 使用自动混合精度训练
         with amp.autocast():
-            bz_loss, y_hat, y_hat_fake = model(subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask, labels)
+            loss, score_real, score_70_news = model(subgraph, mapping_idx, candidate_news, candidate_entity, entity_mask,
+                                                    fake_candidate_news, fake_candidate_entity, fake_entity_mask, labels)
 
         # 累积梯度
-        scaler.scale(bz_loss).backward()
+        scaler.scale(loss).backward()
 
         # 梯度更新周期
         if cnt % cfg.accumulation_steps == 0 or cnt == int(cfg.dataset.pos_count / cfg.batch_size):
@@ -65,24 +72,21 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
                 ## https://discuss.pytorch.org/t/userwarning-detected-call-of-lr-scheduler-step-before-optimizer-step/164814
             optimizer.zero_grad(set_to_none=True)  # 清除梯度
 
-        sum_loss += bz_loss.data.float()  # 累加损失
-        sum_auc += area_under_curve(labels, y_hat)  # 累加AUC指标
+        sum_loss += loss.data.float()  # 累加损失
+        sum_auc += area_under_curve(labels, score_real)  # 累加AUC指标
     
-        # 添加假新闻指标计算
-        # 为假新闻创建负标签（假设所有假新闻都应该被识别为不推荐）
-        fake_labels = torch.zeros(y_hat_fake.shape[0], dtype=torch.long, device=y_hat_fake.device)
-        sum_fake_acc += area_under_curve(fake_labels, y_hat_fake)  # 假新闻识别准确率
+        sum_70_news_auc += area_under_curve(labels, score_70_news)  # 累加基于 70 条新闻的 AUC
 
         # ---------------------------------------- 训练日志
         if cnt % cfg.log_steps == 0:
-            print('[{}] Ed: {}, average_loss: {:.5f}, real_news_acc: {:.5f}, fake_news_acc: {:.5f}'.format(
+            logger.info('[{}]: Ed: {}, average_loss: {:.5f}, real_news_auc: {:.5f}, 70_news_auc: {:.5f}'.format(
                 local_rank, cnt * cfg.batch_size, 
                 sum_loss.item() / cfg.log_steps, 
                 sum_auc.item() / cfg.log_steps,
-                sum_fake_acc.item() / cfg.log_steps))
+                sum_70_news_auc.item() / cfg.log_steps))
             sum_loss.zero_()  # 清零累积损失
             sum_auc.zero_()  # 清零累积AUC
-            sum_fake_acc.zero_()  # 清零假新闻准确率
+            sum_70_news_auc.zero_()  # 清零基于 70 条新闻的 AUC
 
         # 如果超过一定步数，进行验证
         if cnt > int(cfg.val_skip_epochs * (cfg.dataset.pos_count // cfg.batch_size + 1)) and cnt % cfg.val_steps == 0:
@@ -90,10 +94,14 @@ def train(model, optimizer, scaler, scheduler, dataloader, local_rank, cfg, earl
             model.train()  # 验证后切换回训练模式
 
             if local_rank == 0:
-                pretty_print(res)  # 打印验证结果
+                logger.info(
+                "Epoch {:03d} | Validation | AUC_real: {:.4f} | MRR_real: {:.4f} | NDCG5_real: {:.4f} | NDCG10_real: {:.4f} | AUC_70: {:.4f} | MRR_70: {:.4f} | NDCG5_70: {:.4f} | NDCG10_70: {:.4f}".format(
+                    epoch, res["auc_real"], res["mrr_real"], res["ndcg5_real"], res["ndcg10_real"], res["auc_70"], res["mrr_70"], res["ndcg5_70"], res["ndcg10_70"]
+                )
+            )
                 #wandb.log(res)  # 记录到wandb
 
-            early_stop, get_better = early_stopping(res['auc'])  # 判断是否提前停止
+            early_stop, get_better = early_stopping(res['auc_real'])  # 判断是否提前停止
             if early_stop:
                 print("Early Stop.")
                 break  # 提前停止
@@ -122,30 +130,39 @@ def val(model, local_rank, cfg):
             clicked_entity = clicked_entity.to(local_rank, non_blocking=True)
 
             # 模型评估阶段的处理过程
-            scores = model.module.validation_process(subgraph, mappings, clicked_entity, candidate_emb,
+            scores_real, scores_70_news = model.module.validation_process(subgraph, mappings, clicked_entity, candidate_emb,
                                                      candidate_entity, entity_mask)
 
-            tasks.append((labels.tolist(), scores))  # 将结果存储起来
+            tasks.append((labels.cpu().numpy(), scores_real.cpu().numpy(), scores_70_news.cpu().numpy()))
 
     # 使用多进程池计算各项指标
     with mp.Pool(processes=cfg.num_workers) as pool:
         results = pool.map(cal_metric, tasks)  # 计算每个任务的指标
-    val_auc, val_mrr, val_ndcg5, val_ndcg10 = np.array(results).T  # 提取各个指标
+    val_auc_real, val_mrr_real, val_ndcg5_real, val_ndcg10_real, val_auc_70, val_mrr_70, val_ndcg5_70, val_ndcg10_70 = np.array(results).T  # 提取各个指标
 
     # barrier
     torch.distributed.barrier()  # 用于同步不同GPU的进程
 
     # 汇总不同GPU的结果
-    reduced_auc = reduce_mean(torch.tensor(np.nanmean(val_auc)).float().to(local_rank), cfg.gpu_num)
-    reduced_mrr = reduce_mean(torch.tensor(np.nanmean(val_mrr)).float().to(local_rank), cfg.gpu_num)
-    reduced_ndcg5 = reduce_mean(torch.tensor(np.nanmean(val_ndcg5)).float().to(local_rank), cfg.gpu_num)
-    reduced_ndcg10 = reduce_mean(torch.tensor(np.nanmean(val_ndcg10)).float().to(local_rank), cfg.gpu_num)
+    reduced_auc_real = reduce_mean(torch.tensor(np.nanmean(val_auc_real)).float().to(local_rank), cfg.gpu_num)
+    reduced_mrr_real = reduce_mean(torch.tensor(np.nanmean(val_mrr_real)).float().to(local_rank), cfg.gpu_num)
+    reduced_ndcg5_real = reduce_mean(torch.tensor(np.nanmean(val_ndcg5_real)).float().to(local_rank), cfg.gpu_num)
+    reduced_ndcg10_real = reduce_mean(torch.tensor(np.nanmean(val_ndcg10_real)).float().to(local_rank), cfg.gpu_num)
+
+    reduced_auc_70 = reduce_mean(torch.tensor(np.nanmean(val_auc_70)).float().to(local_rank), cfg.gpu_num)
+    reduced_mrr_70 = reduce_mean(torch.tensor(np.nanmean(val_mrr_70)).float().to(local_rank), cfg.gpu_num)
+    reduced_ndcg5_70 = reduce_mean(torch.tensor(np.nanmean(val_ndcg5_70)).float().to(local_rank), cfg.gpu_num)
+    reduced_ndcg10_70 = reduce_mean(torch.tensor(np.nanmean(val_ndcg10_70)).float().to(local_rank), cfg.gpu_num)
 
     res = {
-        "auc": reduced_auc.item(),
-        "mrr": reduced_mrr.item(),
-        "ndcg5": reduced_ndcg5.item(),
-        "ndcg10": reduced_ndcg10.item(),
+        "auc_real": reduced_auc_real.item(),
+        "mrr_real": reduced_mrr_real.item(),
+        "ndcg5_real": reduced_ndcg5_real.item(),
+        "ndcg10_real": reduced_ndcg10_real.item(),
+        "auc_70": reduced_auc_70.item(),
+        "mrr_70": reduced_mrr_70.item(),
+        "ndcg5_70": reduced_ndcg5_70.item(),
+        "ndcg10_70": reduced_ndcg10_70.item(),
     }
 
     return res

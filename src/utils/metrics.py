@@ -47,12 +47,20 @@ def ctr_score(y_true, y_score, k=1):
     return np.mean(y_true)
 
 
-def cal_metric(pair):
-    auc = roc_auc_score(*pair)
-    mrr = mrr_score(*pair)
-    ndcg5 = ndcg_score(*pair, 5)
-    ndcg10 = ndcg_score(*pair, 10)
-    return  auc, mrr, ndcg5, ndcg10
+def cal_metric(args):
+    labels, scores_real, scores_70_news = args
+
+    auc_real = roc_auc_score(labels, scores_real)
+    mrr_real = mrr_score(labels, scores_real)
+    ndcg5_real = ndcg_score(labels, scores_real, 5)
+    ndcg10_real = ndcg_score(labels, scores_real, 10)
+
+    auc_70 = roc_auc_score(labels, scores_70_news)
+    mrr_70 = mrr_score(labels, scores_70_news)
+    ndcg5_70 = ndcg_score(labels, scores_70_news, 5)
+    ndcg10_70 = ndcg_score(labels, scores_70_news, 10)
+
+    return auc_real, mrr_real, ndcg5_real, ndcg10_real, auc_70, mrr_70, ndcg5_70, ndcg10_70
 
 
 # Diversity Metrics

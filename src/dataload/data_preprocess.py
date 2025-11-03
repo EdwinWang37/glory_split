@@ -15,6 +15,9 @@ import torch
 import json
 import itertools
 
+# 导入VAE虚假新闻生成器
+from .vae_fake_news_generator import IntegratedFakeNewsGenerator
+
 
 def update_dict(target_dict, key, value=None):
     """
@@ -56,6 +59,22 @@ def prepare_distributed_data_with_fake_news(cfg, mode="train"):
     """
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
 
+    device = torch.device(cfg.device if torch.cuda.is_available() and cfg.device else "cpu")
+    fake_news_generator = IntegratedFakeNewsGenerator(cfg, device=device)
+
+    fake_news_generator.load_news_encoder(cfg.model.news_encoder_path)
+
+    if mode == 'train':
+        # 加载真实新闻数据
+        real_news_data, real_news_indices, news_dict_from_generator, real_news_ids = fake_news_generator.load_real_news_data(cfg.dataset.dataset_dir, mode='train')
+        fake_news_generator.generate_real_news_vectors(real_news_data)
+        
+        # 训练VAE
+        fake_news_generator.initialize_vae(real_news_data)
+
+        all_fake_news_vectors = {}
+        all_fake_news_ids = []
+
     # 检查是否已处理过目标文件，如果存在且不需要重新处理，则直接返回
     target_file = os.path.join(data_dir[mode], f"behaviors_np{cfg.npratio}_0.tsv")
     if os.path.exists(target_file) and not cfg.reprocess:
@@ -68,20 +87,58 @@ def prepare_distributed_data_with_fake_news(cfg, mode="train"):
     # 获取虚假新闻的起始索引（假设真实新闻索引从1开始）
     fake_news_per_user = getattr(cfg, 'fake_news_per_user', 20)
     
+    # 收集所有用户及其历史数据，用于后续生成用户特定的虚假新闻
+    user_histories = {}
+    
     # 处理训练数据
     if mode == 'train':
+        # 第一遍扫描：收集用户历史数据
+        print("第一遍扫描：收集用户历史数据...")
         with open(behavior_file_path, 'r', encoding='utf-8') as f:
-            for line in tqdm(f):
+            for line in tqdm(f, desc="收集用户历史"):
+                iid, uid, time, history, imp = line.strip().split('\t')
+                if uid not in user_histories:
+                    user_histories[uid] = []
+                if history.strip():
+                    # 收集用户的真实历史点击新闻
+                    user_histories[uid].extend(history.split())
+        
+        # 为每个用户去重历史记录
+        for uid in user_histories:
+            user_histories[uid] = list(set(user_histories[uid]))
+        
+        print(f"收集到 {len(user_histories)} 个用户的历史数据")
+        
+        # 第二遍扫描：生成行为数据并添加虚假新闻
+        with open(behavior_file_path, 'r', encoding='utf-8') as f:
+            for line in tqdm(f, desc="生成训练数据"):
                 iid, uid, time, history, imp = line.strip().split('\t')
                 
-                # 为当前用户生成虚假新闻索引
+                # 为当前用户生成虚假新闻向量和索引
                 # 使用用户ID的哈希值确保同一用户总是生成相同的虚假新闻
                 user_hash = hash(uid) % 10000000  # 限制哈希值范围
+                
+                # 生成虚假新闻向量
+                user_history_news_ids = user_histories.get(uid, [])
+                if user_history_news_ids:
+                    # 获取用户历史新闻的向量表示
+                    user_history_vectors = fake_news_generator.get_news_vectors_by_ids(user_history_news_ids)
+                    generated_ids, generated_vectors = fake_news_generator.generate_personalized_fake_news_vectors(
+                        user_id=uid, user_history_vectors=user_history_vectors, num_fake_news=fake_news_per_user
+                    )
+                else:
+                    # 如果用户没有历史新闻，则生成随机虚假新闻
+                    generated_ids, generated_vectors = fake_news_generator.generate_personalized_fake_news_vectors(
+                        user_id=uid, user_history_vectors=None, num_fake_news=fake_news_per_user
+                    )
+
                 fake_news_indices = []
-                for i in range(fake_news_per_user):
-                    # 生成虚假新闻的虚拟ID，格式为 FAKE_{user_hash}_{i}
-                    fake_id = f"FAKE_{user_hash}_{i}"
+                for fake_id, fake_vector in zip(generated_ids, generated_vectors):
                     fake_news_indices.append(fake_id)
+                    # 存储虚假新闻向量
+                    if fake_id not in all_fake_news_vectors:
+                        all_fake_news_vectors[fake_id] = fake_vector.cpu().numpy()
+                        all_fake_news_ids.append(fake_id)
                 
                 # 将虚假新闻添加到历史点击序列前面
                 fake_history_str = ' '.join(fake_news_indices)
@@ -105,6 +162,12 @@ def prepare_distributed_data_with_fake_news(cfg, mode="train"):
                     new_line = '\t'.join([iid, uid, time, modified_history, pos_id, neg_str]) + '\n'
                     behaviors.append(new_line)
         random.shuffle(behaviors)  # 打乱数据顺序
+
+        # 保存生成的虚假新闻向量和ID
+        with open(os.path.join(data_dir[mode], "fake_news_vectors.bin"), "wb") as f:
+            pickle.dump(all_fake_news_vectors, f)
+        with open(os.path.join(data_dir[mode], "fake_news_ids.bin"), "wb") as f:
+            pickle.dump(all_fake_news_ids, f)
 
         # 根据 GPU 数量将数据分配到不同的文件中
         behaviors_per_file = [[] for _ in range(cfg.gpu_num)]
@@ -160,7 +223,7 @@ def read_raw_news_with_fake(cfg, file_path, mode='train'):
     nltk.download('punkt')  # 下载 NLTK 需要的分词数据
 
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
-    fake_news_per_user = getattr(cfg, 'fake_news_per_user', 10)
+    fake_news_per_user = getattr(cfg, 'fake_news_per_user', 20)
     max_users = getattr(cfg, 'max_users', 100000)  # 预估最大用户数
 
     # 如果是验证集或测试集，则加载已处理好的数据字典
@@ -203,21 +266,30 @@ def read_raw_news_with_fake(cfg, file_path, mode='train'):
                 update_dict(target_dict=subcategory_dict, key=subcategory)
                 word_cnt.update(tokens)
     
-    # 为虚假新闻预分配索引
+    # 为虚假新闻加载并分配索引
     if mode == 'train':
+        # 加载保存的虚假新闻向量和ID
+        try:
+            all_fake_news_vectors = pickle.load(open(Path(data_dir[mode]) / "fake_news_vectors.bin", "rb"))
+            all_fake_news_ids = pickle.load(open(Path(data_dir[mode]) / "fake_news_ids.bin", "rb"))
+        except FileNotFoundError:
+            print("Warning: fake_news_vectors.bin or fake_news_ids.bin not found. This might be expected if not in train mode or fake news generation failed.")
+            all_fake_news_vectors = {}
+            all_fake_news_ids = []
+
         current_max_index = len(news_dict)
         fake_news_start_index = current_max_index + 1
         
-        # 为所有可能的虚假新闻预分配索引
-        for user_hash in range(max_users):
-            for i in range(fake_news_per_user):
-                fake_id = f"FAKE_{user_hash}_{i}"
-                fake_index = fake_news_start_index + user_hash * fake_news_per_user + i
+        # 将虚假新闻添加到 news_dict 和 news 中
+        for i, fake_id in enumerate(all_fake_news_ids):
+            if fake_id not in news_dict:
+                fake_index = fake_news_start_index + i
                 news_dict[fake_id] = fake_index
-                # 为虚假新闻创建空的新闻条目（没有实际属性）
-                news[fake_id] = [[], '', '', [], fake_index]  # 空标题、空分类、空子分类、空实体
+                # 虚假新闻的 news 条目只包含其向量，其他属性为空
+                # 假设 fake_news_vectors 存储的是 numpy 数组，需要转换为 list 或 tensor
+                news[fake_id] = [all_fake_news_vectors[fake_id].tolist(), '', '', [], fake_index] # 存储向量的列表形式
         
-        print(f"Added {max_users * fake_news_per_user} fake news indices, starting from index {fake_news_start_index}")
+        print(f"Loaded and added {len(all_fake_news_ids)} fake news articles.")
 
     if mode == 'train':
         # 对词汇进行过滤，只保留出现频率大于指定值的词
@@ -230,7 +302,7 @@ def read_raw_news_with_fake(cfg, file_path, mode='train'):
 
 def read_parsed_news_with_fake(cfg, news, news_dict,
                                category_dict=None, subcategory_dict=None, entity_dict=None,
-                               word_dict=None):
+                               word_dict=None, user_histories=None):
     # 获取新闻的总数，增加1是因为从1开始索引
     news_num = len(news_dict) + 1  # 包括虚假新闻
     # 初始化分类、子分类、新闻索引、实体的数组
@@ -240,14 +312,64 @@ def read_parsed_news_with_fake(cfg, news, news_dict,
     # 初始化标题的数组
     news_title = np.zeros((news_num, cfg.model.title_size), dtype='int32')
 
+    # 初始化VAE生成器（如果启用）
+    vae_generator = None
+    fake_news_features = {}
+    use_vae_for_fake_news = getattr(cfg, 'use_vae_for_fake_news', False)
+    
+    if use_vae_for_fake_news:
+        print("Extracting fake news features from pre-generated data...")
+        for news_id, news_info in news.items():
+            if news_id.startswith('FAKE_'):
+                # 虚假新闻的向量存储在 news_info 的第一个元素中
+                # 确保它是 numpy 数组
+                fake_news_features[news_id] = np.array(news_info[0], dtype=np.float32)
+        print(f"Extracted {len(fake_news_features)} fake news features.")
+        try:
+            fake_news_features = vae_generator.generate_personalized_fake_news(
+                user_histories=user_histories,
+                num_fake_per_user=getattr(cfg, 'fake_news_per_user', 5),
+                generation_strategy=generation_strategy
+            )
+                    
+            print(f"Successfully generated {len(fake_news_features)} personalized fake news vectors")
+        except Exception as e:
+            print(f"Error initializing VAE generator: {e}")
+            print("Falling back to zero vectors for fake news")
+            use_vae_for_fake_news = False
+    else:
+        print("VAE initialization failed, falling back to zero vectors")
+        use_vae_for_fake_news = False
+
+
     # 遍历所有新闻（包括虚假新闻）
     for _news_id in tqdm(news, total=len(news), desc="Processing parsed news"):
         _title, _category, _subcategory, _entity_ids, _news_index = news[_news_id]
 
         # 检查是否是虚假新闻
         if _news_id.startswith('FAKE_'):
-            # 虚假新闻：所有特征都设为0（已经是默认值）
+            # 虚假新闻处理
             news_index[_news_index, 0] = news_dict[_news_id]
+            
+            if use_vae_for_fake_news and _news_id in fake_news_features:
+                # 使用VAE生成的特征
+                fake_vector = fake_news_features[_news_id]
+                
+                # 将VAE生成的向量转换为标题token（简化处理）
+                # 这里我们将向量的前title_size个元素映射到词汇表
+                if len(fake_vector) >= cfg.model.title_size:
+                    # 将连续值映射到词汇表索引
+                    vocab_size = len(word_dict) if word_dict else 1000
+                    normalized_vector = (fake_vector[:cfg.model.title_size] + 1) / 2  # 归一化到[0,1]
+                    title_indices = (normalized_vector * vocab_size).astype(int)
+                    title_indices = np.clip(title_indices, 1, vocab_size)  # 确保在有效范围内
+                    news_title[_news_index, :] = title_indices
+                
+                print(f"Applied VAE-generated features for {_news_id}")
+            else:
+                # 回退到零向量（原有逻辑）
+                pass  # 所有特征都已经初始化为0
+            
             continue
         
         # 真实新闻：正常处理
@@ -274,6 +396,30 @@ def prepare_preprocess_bin(cfg, mode):
     data_dir = {"train": cfg.dataset.train_dir, "val": cfg.dataset.val_dir, "test": cfg.dataset.test_dir}
 
     if cfg.reprocess is True:
+        # 加载用户历史数据（如果是训练模式）
+        user_histories = None
+        if mode == "train":
+            # 从分布式数据文件中收集用户历史数据
+            user_histories = {}
+            for i in range(cfg.gpus):
+                behavior_file = Path(data_dir[mode]) / f"behaviors_{i}.tsv"
+                if behavior_file.exists():
+                    with open(behavior_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 5:
+                                user_id = parts[1]
+                                history = parts[3].split()
+                                if user_id not in user_histories:
+                                    user_histories[user_id] = set()
+                                user_histories[user_id].update(history)
+            
+            # 转换为列表格式
+            for user_id in user_histories:
+                user_histories[user_id] = list(user_histories[user_id])
+            
+            print(f"Collected user histories for {len(user_histories)} users")
+
         # 使用修改后的函数来处理虚假新闻
         nltk_news, nltk_news_dict, category_dict, subcategory_dict, entity_dict, word_dict = read_raw_news_with_fake(
             file_path=Path(data_dir[mode]) / "news.tsv",
@@ -297,10 +443,10 @@ def prepare_preprocess_bin(cfg, mode):
         pickle.dump(nltk_news, open(Path(data_dir[mode]) / "nltk_news.bin", "wb"))
         pickle.dump(nltk_news_dict, open(Path(data_dir[mode]) / "news_dict.bin", "wb"))
 
-        # 使用修改后的函数解析新闻数据并合并特征
+        # 使用修改后的函数解析新闻数据并合并特征，传递用户历史数据
         nltk_news_features = read_parsed_news_with_fake(cfg, nltk_news, nltk_news_dict,
                                               category_dict, subcategory_dict, entity_dict,
-                                              word_dict)
+                                              word_dict, user_histories)
         news_input = np.concatenate([x for x in nltk_news_features], axis=1)
         pickle.dump(news_input, open(Path(data_dir[mode]) / "nltk_token_news.bin", "wb"))
         print("Glove token preprocess finish.")

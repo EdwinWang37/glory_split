@@ -1,0 +1,96 @@
+# 优化后的VAE虚假新闻生成配置
+# 支持均匀分布生成策略
+
+# VAE基础配置
+use_vae_for_fake_news: true
+vae_latent_dim: 50
+vae_training_epochs: 1000
+news_encoder_model_path: "models/news_encoder.pth"
+seed: 42
+gpu_num: 0
+reprocess: False
+reprocess_neighbors: False
+num_epochs: 10
+batch_size: 16
+accumulation_steps: 1
+warmup_ratio: 0.1
+log_steps: 100
+val_skip_epochs: 0
+val_steps: 1000
+num_workers: 8
+load_checkpoint: False
+load_mark: "best"
+early_stop_patience: 5
+dropout_probability: 0.1
+
+# 生成策略配置
+fake_news_generation_strategy: "uniform_space_filling"  # 可选: "uniform_space_filling", "anti_interest", "global_uniform"
+fake_news_per_user: 20
+
+# 空间填充算法参数
+diversity_weight: 1.0      # 多样性权重，控制虚假向量之间的距离
+coverage_weight: 1.5       # 覆盖权重，控制对整个空间的覆盖
+generation_iterations: 800 # 生成优化迭代次数
+
+# PCA均匀分布参数
+pca_components: 50         # PCA降维维度
+total_fake_news: 1000      # 全局均匀生成时的总虚假新闻数量
+
+# 分布验证参数
+validate_uniformity: true  # 是否验证生成的分布均匀性
+uniformity_threshold: 0.3  # 均匀性阈值
+npratio: 4
+
+# 数据集配置
+dataset:
+  train_dir: "data/MINDsmall/train"
+  val_dir: "data/MINDsmall/val"
+  test_dir: "data/MINDsmall/test"
+  pos_count: 1
+  dataset_lang: english
+
+path:
+  ckp_dir: "checkpoints"
+  glove_path: "data/glove/glove.840B.300d.txt"
+
+logger:
+  exp_name: "GLORY_split_VAE"
+  run_name: "uniform_vae_run"
+  
+# 模型配置
+model:
+  title_size: 30
+  abstract_size: 50
+  use_graph: true
+  directed: False
+  use_entity: True
+  model_name: GLORYSplit
+  word_emb_dim: 300
+  head_num: 4
+  head_dim: 20
+  entity_emb_dim: 300
+  his_size: 10
+  k_hops: 2
+  num_neighbors: 20
+  entity_size: 5
+  entity_neighbors: 20
+  attention_hidden_dim: 200
+
+
+optimizer:
+  lr: 0.001
+  
+# 训练配置
+training:
+  epochs: 10
+
+# 评估配置
+evaluation:
+  metrics: ["auc", "mrr", "ndcg@5", "ndcg@10"]
+  
+# 可视化配置
+visualization:
+  enable_plots: true
+  save_path: "results/vae_analysis/"
+  plot_pca_distribution: true
+  plot_tsne_distribution: true

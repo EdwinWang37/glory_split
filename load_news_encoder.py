@@ -12,18 +12,25 @@ from models.component.news_encoder import NewsEncoder
 from models.base.layers import *
 
 class NewsVectorizer:
-    def __init__(self, model_path, cfg=None):
+    def __init__(self, model_path, cfg=None, device=None):
         """
         初始化新闻向量化器
         
         Args:
             model_path: 模型文件路径
             cfg: 配置对象（如果没有提供，将使用默认配置）
+            device: 可选，指定设备，如 'cpu' 或 'cuda'
         """
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # 允许外部指定设备，默认自动选择
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
         
         # 加载模型
-        print(f"Loading model from: {model_path}")
+        # print(f"Loading model from: {model_path}")
+        model_path = str(model_path)
+        print(f"[DEBUG] In NewsVectorizer.__init__, model_path type: {type(model_path)}, value: {model_path}")
         checkpoint = torch.load(model_path, map_location=self.device)
         
         # 如果没有提供配置，创建一个默认配置
@@ -37,7 +44,17 @@ class NewsVectorizer:
         # 从checkpoint中提取词汇表大小
         vocab_size = self._extract_vocab_size(checkpoint)
         
-        self.news_encoder = NewsEncoder(cfg, glove_emb=vocab_size)
+        glove_emb_param = None
+        if self.cfg.dataset.dataset_lang == 'english':
+            emb_dim = self.cfg.model.word_emb_dim
+            # The vocab_size from _extract_vocab_size is max_index, so matrix size is vocab_size + 1
+            embedding_matrix_size = vocab_size + 1
+            print(f"[DEBUG] Creating dummy embedding matrix for English mode: shape=({embedding_matrix_size}, {emb_dim})")
+            glove_emb_param = np.zeros((embedding_matrix_size, emb_dim), dtype=np.float32)
+        else:
+            glove_emb_param = vocab_size
+
+        self.news_encoder = NewsEncoder(cfg, glove_emb=glove_emb_param)
         
         # 加载local_news_encoder的权重
         self._load_news_encoder_weights(checkpoint)
@@ -69,42 +86,47 @@ class NewsVectorizer:
     
     def _extract_vocab_size(self, checkpoint):
         """从checkpoint中提取词汇表大小"""
-        # 查找local_news_encoder的word_encoder权重
-        for key in checkpoint.keys():
+        # 调试：打印checkpoint结构
+        print(f"[DEBUG] Checkpoint type: {type(checkpoint)}, keys: {list(checkpoint.keys())[:5]}...")
+        
+        # 查找word_encoder.weight（兼容不同前缀）
+        for key in checkpoint:
             if isinstance(checkpoint[key], dict):
-                for sub_key in checkpoint[key].keys():
-                    if 'local_news_encoder.word_encoder.weight' in sub_key:
+                for sub_key in checkpoint[key]:
+                    if 'news_encoder.word_encoder.weight' in sub_key or 'local_news_encoder.word_encoder.weight' in sub_key:
                         vocab_size = checkpoint[key][sub_key].shape[0]
-                        print(f"Detected vocabulary size: {vocab_size}")
+                        print(f"[DEBUG] Detected vocabulary size: {vocab_size} from {sub_key}")
                         return vocab_size - 1  # 减1因为padding_idx=0
         
-        # 如果没有找到，使用默认值
-        print("Could not detect vocabulary size, using default: 50000")
-        return 50000
+        # 如果没有找到，抛出错误
+        raise ValueError("Failed to extract vocab size: no word_encoder.weight found in checkpoint")
     
     def _load_news_encoder_weights(self, checkpoint):
         """加载NewsEncoder的权重"""
-        # 提取local_news_encoder的权重
         news_encoder_state_dict = {}
         
-        for key in checkpoint.keys():
+        # 提取新闻编码器权重（兼容不同前缀）
+        for key in checkpoint:
             if isinstance(checkpoint[key], dict):
                 for param_key, param_value in checkpoint[key].items():
-                    if param_key.startswith('local_news_encoder.'):
-                        # 移除'local_news_encoder.'前缀
-                        new_key = param_key.replace('local_news_encoder.', '')
+                    if param_key.startswith('news_encoder.') or param_key.startswith('local_news_encoder.'):
+                        new_key = param_key.replace('news_encoder.', '').replace('local_news_encoder.', '')
                         news_encoder_state_dict[new_key] = param_value
         
-        if news_encoder_state_dict:
-            print(f"Found {len(news_encoder_state_dict)} parameters for NewsEncoder")
-            # 加载权重
-            missing_keys, unexpected_keys = self.news_encoder.load_state_dict(news_encoder_state_dict, strict=False)
-            if missing_keys:
-                print(f"Missing keys: {missing_keys}")
-            if unexpected_keys:
-                print(f"Unexpected keys: {unexpected_keys}")
-        else:
-            print("Warning: No NewsEncoder weights found in checkpoint")
+        if not news_encoder_state_dict:
+            raise ValueError("No NewsEncoder weights found in checkpoint")
+        
+        print(f"[DEBUG] Loading {len(news_encoder_state_dict)} parameters into NewsEncoder")
+        missing_keys, unexpected_keys = self.news_encoder.load_state_dict(news_encoder_state_dict, strict=False)
+        
+        if missing_keys:
+            print(f"[WARNING] Missing keys in NewsEncoder: {missing_keys}")
+        if unexpected_keys:
+            print(f"[WARNING] Unexpected keys in NewsEncoder: {unexpected_keys}")
+        
+        # 验证权重是否加载成功
+        if not any(p.requires_grad for p in self.news_encoder.parameters()):
+            raise RuntimeError("NewsEncoder weights are not trainable/loaded")
     
     def vectorize_news(self, news_text_ids, mask=None):
         """
@@ -113,7 +135,8 @@ class NewsVectorizer:
         Args:
             news_text_ids: 新闻文本的token IDs，形状为 [batch_size, news_num, sequence_length]
                           或 [news_num, sequence_length] 或 [sequence_length]
-            mask: 可选的mask，形状应与news_text_ids的前两个维度匹配
+            mask: 可选的mask。若不提供，将自动根据padding(>0为1，=0为0)生成。
+                  最终传入模型的mask形状为 [batch_size * news_num, sequence_length]
         
         Returns:
             新闻向量，形状为 [batch_size, news_num, news_dim]
@@ -165,8 +188,31 @@ class NewsVectorizer:
                 entity_placeholder  # entity (1)
             ], dim=-1)
             
-            # 进行向量化
-            news_vectors = self.news_encoder(news_input, mask)
+            # 自动生成mask：仅在未提供时
+            # mask 需要形状 [batch_size * news_num, title_size]
+            if mask is None:
+                # 对title部分生成mask，>0为有效token
+                auto_mask = (news_text_ids > 0).float()
+                mask_flat = auto_mask.view(-1, title_size)
+            else:
+                # 若外部提供mask，则规范化到期望形状
+                if isinstance(mask, torch.Tensor):
+                    mask = mask.to(self.device)
+                else:
+                    mask = torch.tensor(mask, dtype=torch.float32, device=self.device)
+
+                # 兼容 [batch_size, news_num, title_size] 或 [batch_size*news_num, title_size]
+                if mask.dim() == 3:
+                    mask_flat = mask.view(-1, title_size).float()
+                elif mask.dim() == 2 and mask.shape == (batch_size * news_num, title_size):
+                    mask_flat = mask.float()
+                else:
+                    # 形状不匹配时，回退到自动mask
+                    auto_mask = (news_text_ids > 0).float()
+                    mask_flat = auto_mask.view(-1, title_size)
+
+            # 进行向量化（传入规范化后的mask）
+            news_vectors = self.news_encoder(news_input, mask_flat)
             
             # 根据原始输入形状调整输出
             if len(original_shape) == 1:
@@ -316,7 +362,7 @@ def get_news_vectors_for_user(data_dir="./", user_index=0):
         user_index: 用户索引
     """
     # 模型路径
-    model_path = 'GLORY_MINDsmall_default_auc0.6760649681091309.pth'
+    model_path = '/home/luoyf/GLORY_split/checkpoint/GLORY_MINDsmall_default_auc0.6760649681091309.pth'
     
     # 初始化向量化器
     print("=== 初始化新闻向量化器 ===")

@@ -1,0 +1,21 @@
+# VAE虚假新闻生成器配置
+vae:
+  # 是否启用VAE生成虚假新闻向量（默认为false，使用零向量）
+  use_vae_for_fake_news: true
+  
+  # VAE模型参数
+  latent_dim: 50  # VAE潜在空间维度
+  training_epochs: 1000  # VAE训练轮数
+  generation_iterations: 500  # 生成虚假新闻时的优化迭代次数
+  
+  # 虚假新闻生成参数
+  fake_news_per_user: 10  # 每个用户的虚假新闻数量
+  
+  # 新闻编码器模型路径（用于生成真实新闻向量来训练VAE）
+  news_encoder_model_path: "/home/luoyf/GLORY_split/checkpoint/GLORY_MINDsmall_default_auc0.6760649681091309.pth"
+  
+  # 批处理大小（生成新闻向量时使用）
+  batch_size: 32
+  
+  # 设备设置
+  device: "cuda"  # 或 "cpu"

@@ -11,7 +11,7 @@ defaults:
 
 seed: 3407 # 3407 is all you need
 num_epochs: 16
-batch_size: 128  # dataloaders'batch_size = batch_size / gpu_num
+batch_size: 64  # dataloaders'batch_size = batch_size / gpu_num
 npratio: 4
 accumulation_steps: 1
 # final total actual batch_size = batch_size * accumalation_steps

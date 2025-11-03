@@ -4,6 +4,7 @@ from torch.utils.data import IterableDataset, Dataset
 from torch_geometric.data import Data, Batch
 from torch_geometric.utils import subgraph
 import numpy as np
+from .vae_fake_news_generator import IntegratedFakeNewsGenerator # Import the fake news generator
 
 
 class TrainDataset(IterableDataset):
@@ -62,10 +63,27 @@ class TrainGraphDataset(TrainDataset):
         self.news_graph = news_graph.to(local_rank, non_blocking=True)
         self.batch_size = cfg.batch_size / cfg.gpu_num
         self.entity_neighbors = entity_neighbors
+        self.fake_news_generator = IntegratedFakeNewsGenerator(cfg, device=f'cuda:{local_rank}')
+        self.fake_news_generator.load_news_encoder(cfg.model.news_encoder_path)
+        self.fake_news_generator.initialize_vae() # Instantiate the fake news generator with correct parameters
 
     def line_mapper(self, line, sum_num_news):
         line = line.strip().split('\t')
-        click_id = line[3].split()[-self.cfg.model.his_size:]  # 取最近的历史新闻
+        real_click_id = line[3].split() # Get real historical news
+        
+        # Generate 20 fake news for the user (restored)
+        # Assuming generate_personalized_fake_news_vectors takes user_id and returns a list of fake news IDs
+        fake_news_ids, _ = self.fake_news_generator.generate_personalized_fake_news_vectors(num_fake_news=20) # Assuming generate_personalized_fake_news_vectors does not need user_id directly
+        
+        # Prepend fake news to real news
+        combined_click_id = fake_news_ids + real_click_id
+        
+        # Handle padding/truncation to his_size (70)
+        if len(combined_click_id) > self.cfg.model.his_size:
+            click_id = combined_click_id[-self.cfg.model.his_size:] # Truncate from the end if more than 70
+        else:
+            click_id = combined_click_id # Use as is, padding will be handled by pad_to_fix_len
+        
         sess_pos = line[4].split()
         sess_neg = line[5].split()
 
@@ -87,15 +105,19 @@ class TrainGraphDataset(TrainDataset):
 
         # ------------------ 候选新闻 ---------------------
         label = 0
-        sample_news = self.trans_to_nindex(sess_pos + sess_neg)
+        sample_news = np.atleast_1d(self.trans_to_nindex(sess_pos))
         candidate_input = self.news_input[sample_news]
+
+        # ------------------ 假新闻候选 ---------------------
+        fake_sample_news = np.atleast_1d(self.trans_to_nindex(sess_neg))
+        fake_candidate_input = self.news_input[fake_sample_news]
 
         # ------------------ 实体子图 --------------------
         if self.cfg.model.use_entity:
             origin_entity = candidate_input[:, -3 - self.cfg.model.entity_size:-3]  # [5, 5]
             candidate_neighbor_entity = np.zeros(
-                ((self.cfg.npratio + 1) * self.cfg.model.entity_size, self.cfg.model.entity_neighbors),
-                dtype=np.int64)  # [5*5, 20]
+                (self.cfg.model.entity_size, self.cfg.model.entity_neighbors),
+                dtype=np.int64)
             
             # 获取实体邻居
             for cnt, idx in enumerate(origin_entity.flatten()):
@@ -105,17 +127,38 @@ class TrainGraphDataset(TrainDataset):
                 valid_len = min(entity_dict_length, self.cfg.model.entity_neighbors)
                 candidate_neighbor_entity[cnt, :valid_len] = self.entity_neighbors[idx][:valid_len]
 
-            candidate_neighbor_entity = candidate_neighbor_entity.reshape(self.cfg.npratio + 1,
-                                                                          self.cfg.model.entity_size * self.cfg.model.entity_neighbors)  # [5, 5*20]
+            # 调整维度以匹配 origin_entity 的形状 (1, entity_size)
+            candidate_neighbor_entity = candidate_neighbor_entity.reshape(1, self.cfg.model.entity_size * self.cfg.model.entity_neighbors)  # [1, 5*20]
             entity_mask = candidate_neighbor_entity.copy()
             entity_mask[entity_mask > 0] = 1
+            # 沿 axis=-1 拼接 (1, entity_size + entity_size*entity_neighbors)
             candidate_entity = np.concatenate((origin_entity, candidate_neighbor_entity), axis=-1)
+
+            # ------------------ 假新闻实体子图 ---------------------
+            fake_origin_entity = fake_candidate_input[:, -3 - self.cfg.model.entity_size:-3]
+            fake_candidate_neighbor_entity = np.zeros(
+                (self.cfg.npratio * self.cfg.model.entity_size, self.cfg.model.entity_neighbors),
+                dtype=np.int64)
+            for cnt, idx in enumerate(fake_origin_entity.flatten()):
+                if idx == 0: continue
+                entity_dict_length = len(self.entity_neighbors[idx])
+                if entity_dict_length == 0: continue
+                valid_len = min(entity_dict_length, self.cfg.model.entity_neighbors)
+                fake_candidate_neighbor_entity[cnt, :valid_len] = self.entity_neighbors[idx][:valid_len]
+
+            fake_candidate_neighbor_entity = fake_candidate_neighbor_entity.reshape(self.cfg.npratio,
+                                                                          self.cfg.model.entity_size * self.cfg.model.entity_neighbors)
+            fake_entity_mask = fake_candidate_neighbor_entity.copy()
+            fake_entity_mask[fake_entity_mask > 0] = 1
+            fake_candidate_entity = np.concatenate((fake_origin_entity, fake_candidate_neighbor_entity), axis=-1)
         else:
             candidate_entity = np.zeros(1)
             entity_mask = np.zeros(1)
+            fake_candidate_entity = np.zeros(1)
+            fake_entity_mask = np.zeros(1)
 
         return sub_news_graph, padded_maping_idx, candidate_input, candidate_entity, entity_mask, label, \
-            sum_num_news + sub_news_graph.num_nodes
+            fake_candidate_input, fake_candidate_entity, fake_entity_mask, sum_num_news + sub_news_graph.num_nodes
 
     # 构建新闻子图
     def build_subgraph(self, subset, k, sum_num_nodes):
@@ -145,11 +188,15 @@ class TrainGraphDataset(TrainDataset):
 
             candidate_entity_list = []
             entity_mask_list = []
+            fake_candidate_input_list = []
+            fake_candidate_entity_list = []
+            fake_entity_mask_list = []
             sum_num_news = 0
             with open(self.filename) as f:
                 for line in f:
-                    sub_newsgraph, padded_mapping_idx, candidate_input, candidate_entity, entity_mask, label, sum_num_news = self.line_mapper(
-                        line, sum_num_news)
+                    sub_newsgraph, padded_mapping_idx, candidate_input, candidate_entity, entity_mask, label, \
+                        fake_candidate_input, fake_candidate_entity, fake_entity_mask, sum_num_news = self.line_mapper(
+                            line, sum_num_news)
 
                     clicked_graphs.append(sub_newsgraph)
                     candidates.append(torch.from_numpy(candidate_input))
@@ -158,6 +205,9 @@ class TrainGraphDataset(TrainDataset):
 
                     candidate_entity_list.append(torch.from_numpy(candidate_entity))
                     entity_mask_list.append(torch.from_numpy(entity_mask))
+                    fake_candidate_input_list.append(torch.from_numpy(fake_candidate_input))
+                    fake_candidate_entity_list.append(torch.from_numpy(fake_candidate_entity))
+                    fake_entity_mask_list.append(torch.from_numpy(fake_entity_mask))
 
                     # 当达到 batch_size 时，返回一个 batch
                     if len(clicked_graphs) == self.batch_size:
@@ -167,10 +217,15 @@ class TrainGraphDataset(TrainDataset):
                         mappings = torch.stack(mappings)
                         candidate_entity_list = torch.stack(candidate_entity_list)
                         entity_mask_list = torch.stack(entity_mask_list)
+                        fake_candidate_input_list = torch.stack(fake_candidate_input_list)
+                        fake_candidate_entity_list = torch.stack(fake_candidate_entity_list)
+                        fake_entity_mask_list = torch.stack(fake_entity_mask_list)
 
                         labels = torch.tensor(labels, dtype=torch.long)
-                        yield batch, mappings, candidates, candidate_entity_list, entity_mask_list, labels
+                        yield batch, mappings, candidates, candidate_entity_list, entity_mask_list, labels, \
+                            fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list
                         clicked_graphs, mappings, candidates, labels, candidate_entity_list, entity_mask_list = [], [], [], [], [], []
+                        fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list = [], [], []
                         sum_num_news = 0
 
                 # 处理剩余的数据
@@ -181,9 +236,13 @@ class TrainGraphDataset(TrainDataset):
                     mappings = torch.stack(mappings)
                     candidate_entity_list = torch.stack(candidate_entity_list)
                     entity_mask_list = torch.stack(entity_mask_list)
+                    fake_candidate_input_list = torch.stack(fake_candidate_input_list)
+                    fake_candidate_entity_list = torch.stack(fake_candidate_entity_list)
+                    fake_entity_mask_list = torch.stack(fake_entity_mask_list)
                     labels = torch.tensor(labels, dtype=torch.long)
 
-                    yield batch, mappings, candidates, candidate_entity_list, entity_mask_list, labels
+                    yield batch, mappings, candidates, candidate_entity_list, entity_mask_list, labels, \
+                        fake_candidate_input_list, fake_candidate_entity_list, fake_entity_mask_list
                     f.seek(0)
 
 

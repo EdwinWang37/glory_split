@@ -74,8 +74,9 @@ def main():
     
     # 生成两种不同类型的向量
     anti_vectors = generator.generate_fake_news(original_vectors.mean(dim=0), num_samples=n_generate)
-    uniform_vectors_adversarial = generator.generate_uniform_vectors(num_samples=n_generate, method='adversarial')
-    uniform_vectors_enhanced = generator.generate_uniform_vectors(num_samples=n_generate, method='enhanced_vae')
+    dummy_user_real_vectors = torch.randn(2, input_dim, device=device)
+    uniform_vectors_adversarial = generator.generate_uniform_space_filling_vectors(user_real_vectors=dummy_user_real_vectors, num_fake_per_user=n_generate)
+    uniform_vectors_enhanced = generator.generate_uniform_space_filling_vectors(user_real_vectors=dummy_user_real_vectors, num_fake_per_user=n_generate)
     
     # 可视化三种向量的分布
     visualize_vectors(original_vectors, anti_vectors, uniform_vectors_adversarial, title="Vector Distribution (Adversarial Uniform)", filename="vector_distribution_adversarial.png")
