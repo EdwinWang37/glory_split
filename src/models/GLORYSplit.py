@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import Sequential, GatedGraphConv
 
 from models.base.layers import *
@@ -167,16 +168,23 @@ class GLORYSplit(nn.Module):
         # 添加假新闻生成器（如果需要动态生成）
         # self.fake_news_generator = FakeNewsGenerator(cfg)
 
-    def compute_security_loss(self, score_real, score_fake_candidate, label):
-        # 这是一个占位符实现，需要根据实际的损失函数逻辑进行修改
-        # 例如，可以计算交叉熵损失或自定义损失
-        # 这里简单返回一个常数作为示例
-        if label is not None:
-            # 假设我们有一个简单的二分类交叉熵损失
-            loss_real = self.client.loss_fn(score_real, label)
-            loss_fake = self.client.loss_fn(score_fake_candidate, torch.zeros_like(label)) # 假设假新闻的标签是0
-            return loss_real + loss_fake
-        return torch.tensor(0.0)
+    def compute_security_loss(self, score_real, score_fake_candidate, label, alpha: float = 1.0, beta: float = 0.5):
+        """
+        - 实新闻分支：标准 NCE（交叉熵），候选包含 [pos + negs]，且正样本位于索引0 -> label=0
+        - 假新闻分支：对抗项，最小化假新闻的推荐概率（负对数似然的均值）
+        """
+        if label is None:
+            return torch.tensor(0.0, device=score_real.device)
+
+        # 1) 真实新闻损失
+        real_log_prob = F.log_softmax(score_real, dim=1)
+        loss_real = F.nll_loss(real_log_prob, label)
+
+        # 2) 假新闻对抗损失（降低假新闻被推荐的概率）
+        fake_log_prob = F.log_softmax(score_fake_candidate, dim=1)
+        loss_fake = -fake_log_prob.mean()
+
+        return alpha * loss_real + beta * loss_fake
 
     def validation_process(self, subgraph, mapping_idx, clicked_entity, candidate_news, candidate_entity, entity_mask):
         # 客户端计算 x_encoded 和其他特征 (现在用于 70 条历史新闻)

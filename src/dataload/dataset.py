@@ -137,8 +137,12 @@ class TrainGraphDataset(TrainDataset):
         padded_maping_idx = F.pad(mapping_idx, (self.his_size - len(mapping_idx), 0), "constant", -1)
 
         # ------------------ 候选新闻 ---------------------
+        # 训练真实分支需要 [正样本 + 负样本]，并将正样本置于索引0，保证 label=0 有意义
         label = 0
-        sample_news = np.atleast_1d(self.trans_to_nindex(sess_pos))
+        pos_list = sess_pos  # 单个正样本 id 列表
+        neg_list = sess_neg  # npratio 个负样本 id 列表
+        sample_ids = pos_list + neg_list
+        sample_news = np.atleast_1d(self.trans_to_nindex(sample_ids))
         candidate_input = self.news_input[sample_news]
 
         # ------------------ 假新闻候选 ---------------------
@@ -147,24 +151,27 @@ class TrainGraphDataset(TrainDataset):
 
         # ------------------ 实体子图 --------------------
         if self.cfg.model.use_entity:
-            origin_entity = candidate_input[:, -3 - self.cfg.model.entity_size:-3]  # [5, 5]
+            # 对真实候选（含正+负）构建实体邻居，按 ValidGraphDataset 的模式对齐形状
+            origin_entity = candidate_input[:, -3 - self.cfg.model.entity_size:-3]
+            cand_cnt = origin_entity.shape[0]
             candidate_neighbor_entity = np.zeros(
-                (self.cfg.model.entity_size, self.cfg.model.entity_neighbors),
+                (cand_cnt * self.cfg.model.entity_size, self.cfg.model.entity_neighbors),
                 dtype=np.int64)
-            
+
             # 获取实体邻居
             for cnt, idx in enumerate(origin_entity.flatten()):
-                if idx == 0: continue
+                if idx == 0:
+                    continue
                 entity_dict_length = len(self.entity_neighbors[idx])
-                if entity_dict_length == 0: continue
+                if entity_dict_length == 0:
+                    continue
                 valid_len = min(entity_dict_length, self.cfg.model.entity_neighbors)
                 candidate_neighbor_entity[cnt, :valid_len] = self.entity_neighbors[idx][:valid_len]
 
-            # 调整维度以匹配 origin_entity 的形状 (1, entity_size)
-            candidate_neighbor_entity = candidate_neighbor_entity.reshape(1, self.cfg.model.entity_size * self.cfg.model.entity_neighbors)  # [1, 5*20]
+            candidate_neighbor_entity = candidate_neighbor_entity.reshape(
+                cand_cnt, self.cfg.model.entity_size * self.cfg.model.entity_neighbors)
             entity_mask = candidate_neighbor_entity.copy()
             entity_mask[entity_mask > 0] = 1
-            # 沿 axis=-1 拼接 (1, entity_size + entity_size*entity_neighbors)
             candidate_entity = np.concatenate((origin_entity, candidate_neighbor_entity), axis=-1)
 
             # ------------------ 假新闻实体子图 ---------------------
