@@ -47,12 +47,70 @@ def ctr_score(y_true, y_score, k=1):
     return np.mean(y_true)
 
 
-def cal_metric(pair):
-    auc = roc_auc_score(*pair)
-    mrr = mrr_score(*pair)
-    ndcg5 = ndcg_score(*pair, 5)
-    ndcg10 = ndcg_score(*pair, 10)
-    return  auc, mrr, ndcg5, ndcg10
+def cal_metric(args):
+    """Compute metrics for one impression with robust NaN handling.
+
+    - Filters out any pairs where either label or score is non-finite.
+    - Returns AUC as NaN if only one class remains (so the caller's nanmean can ignore it).
+    - Returns 0.0 for MRR/NDCG when there are no positive labels.
+    """
+    labels, scores_real, scores_70_news = args
+
+    def _sanitize(y_true, y_score):
+        yt = np.asarray(y_true).reshape(-1).astype(float)
+        ys = np.asarray(y_score).reshape(-1).astype(float)
+        mask = np.isfinite(yt) & np.isfinite(ys)
+        yt = yt[mask]
+        ys = ys[mask]
+        return yt, ys
+
+    def _safe_auc(yt, ys):
+        # Need both positive and negative labels to compute ROC-AUC
+        if yt.size == 0 or np.unique(yt).size < 2:
+            return np.nan
+        try:
+            return roc_auc_score(yt, ys)
+        except Exception:
+            return np.nan
+
+    def _safe_mrr(yt, ys):
+        if yt.size == 0 or np.sum(yt) == 0:
+            return 0.0
+        return mrr_score(yt, ys)
+
+    def _safe_ndcg(yt, ys, k):
+        if yt.size == 0 or np.sum(yt) == 0:
+            return 0.0
+        # Guard divide-by-zero inside ndcg when ideal DCG is 0
+        ideal = dcg_score(yt, yt, k)
+        if ideal == 0:
+            return 0.0
+        return ndcg_score(yt, ys, k)
+
+    # Real scores
+    ytr, ysr = _sanitize(labels, scores_real)
+    auc_real = _safe_auc(ytr, ysr)
+    mrr_real = _safe_mrr(ytr, ysr)
+    ndcg5_real = _safe_ndcg(ytr, ysr, 5)
+    ndcg10_real = _safe_ndcg(ytr, ysr, 10)
+
+    # 70-news scores
+    yt70, ys70 = _sanitize(labels, scores_70_news)
+    auc_70 = _safe_auc(yt70, ys70)
+    mrr_70 = _safe_mrr(yt70, ys70)
+    ndcg5_70 = _safe_ndcg(yt70, ys70, 5)
+    ndcg10_70 = _safe_ndcg(yt70, ys70, 10)
+
+    return (
+        auc_real,
+        mrr_real,
+        ndcg5_real,
+        ndcg10_real,
+        auc_70,
+        mrr_70,
+        ndcg5_70,
+        ndcg10_70,
+    )
 
 
 # Diversity Metrics
@@ -89,7 +147,6 @@ def density_ILxD(scores, news_emb, top_k=5):
     ilmd = ILMD(nv)
 
     return ilad, ilmd
-
 
 
 

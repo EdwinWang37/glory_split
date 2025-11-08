@@ -1,6 +1,6 @@
-his_size: 50  # Number of sampled click history for each user
+his_size: 70 # Number of sampled click history for each user (20 fake + 50 real)
 title_size: 30
-abstract_size: 50
+abstract_size: 25
 word_freq_threshold: 1
 entity_size: 5
 
@@ -12,8 +12,8 @@ entity_emb_dim: 100
 
 # For additive attention
 attention_hidden_dim: 200
-head_num: 20
-head_dim: 20
+head_num: 10
+head_dim: 10
 word_filter_num: 0
 
 use_graph: false

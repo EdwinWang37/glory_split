@@ -38,15 +38,22 @@ class AttentionPooling(nn.Module):
         nn.init.xavier_uniform_(self.att_fc2.weight)
        
     def forward(self, x, attn_mask=None):
+        # x: [B, L, D]
         e = self.att_fc1(x)
         e = nn.Tanh()(e)
-        alpha = self.att_fc2(e)
-        alpha = torch.exp(alpha)
+        alpha = self.att_fc2(e)  # [B, L, 1]
 
+        # 数值稳定性更好的 masked softmax
         if attn_mask is not None:
-            alpha = alpha * attn_mask.unsqueeze(2)
+            alpha = alpha.masked_fill(attn_mask.unsqueeze(2) == 0, float('-inf'))
+        alpha = torch.softmax(alpha, dim=1)
+        # 如果整行都被 mask，softmax(-inf) 会产生 NaN；将其安全置零
+        if attn_mask is not None:
+            all_masked = (attn_mask.sum(dim=1) == 0).unsqueeze(1).unsqueeze(2)
+            alpha = torch.where(all_masked, torch.zeros_like(alpha), alpha)
+        # 兜底清理可能的 NaN/Inf
+        alpha = torch.where(torch.isfinite(alpha), alpha, torch.zeros_like(alpha))
 
-        alpha = alpha / (torch.sum(alpha, dim=1, keepdim=True) + 1e-8)
         x = torch.bmm(x.permute(0, 2, 1), alpha).squeeze(dim=-1)
         return x
 
@@ -58,19 +65,26 @@ class ScaledDotProductAttention(nn.Module):
 
     def forward(self, Q, K, V, attn_mask=None):
         """
-            Q: batch_size, n_head, candidate_num, d_k
-            K: batch_size, n_head, candidate_num, d_k
-            V: batch_size, n_head, candidate_num, d_v
-            attn_mask: batch_size, n_head, candidate_num
-            Return: batch_size, n_head, candidate_num, d_v
+            Q: [B, H, Lq, d_k]
+            K: [B, H, Lk, d_k]
+            V: [B, H, Lk, d_v]
+            attn_mask: [B, H, Lk]
+            Return: [B, H, Lq, d_v]
         """
         scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(self.d_k)
-        scores = torch.exp(scores)
 
         if attn_mask is not None:
-            scores = scores * attn_mask.unsqueeze(dim=-2)
+            scores = scores.masked_fill(attn_mask.unsqueeze(-2) == 0, float('-inf'))
 
-        attn = scores / (torch.sum(scores, dim=-1, keepdim=True) + 1e-8)
+        attn = torch.softmax(scores, dim=-1)
+        # 当整条序列都被 mask 时，softmax(-inf) -> NaN；为这些条目置零
+        if attn_mask is not None:
+            # attn_mask: [B, H, Lk]
+            # attn:      [B, H, Lq, Lk]
+            # Broadcast condition to both Lq and Lk dimensions
+            all_masked = (attn_mask.sum(dim=-1) == 0).unsqueeze(-1).unsqueeze(-1)
+            attn = torch.where(all_masked, torch.zeros_like(attn), attn)
+        attn = torch.where(torch.isfinite(attn), attn, torch.zeros_like(attn))
         context = torch.matmul(attn, V)
         return context
 
@@ -114,5 +128,3 @@ class MultiHeadAttention(nn.Module):
         if self.residual:
             output += Q
         return output
-
-

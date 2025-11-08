@@ -28,6 +28,26 @@ bash scripts/data_download.sh
 python3 src/main.py model=GLORY dataset=MINDsmall reprocess=True
 ```
 
+### Run on macOS (CPU/MPS)
+
+This repo now supports single‑process training on macOS without NVIDIA GPUs.
+
+- Install tools: `brew install wget unzip`.
+- Create env (recommend Python 3.9+):
+  - `python3 -m venv .venv && source .venv/bin/activate`
+  - Install PyTorch for CPU/MPS following the official instructions for your macOS/Apple Silicon.
+  - Install PyG (torch-geometric) matching your PyTorch version (see the official PyG install guide).
+  - `pip install -r requirements.txt` (after torch/pyg are installed).
+- Download data: `bash scripts/data_download.sh`.
+- Run single‑process training (CPU/MPS auto‑detected):
+  - `python3 src/main.py model=GLORY dataset=MINDsmall device=cpu reprocess=True`
+  - For Apple Silicon try MPS: `python3 src/main.py model=GLORY dataset=MINDsmall device=mps reprocess=True`
+
+Notes:
+- No NCCL/DDP on macOS; training runs single‑process and can be slower.
+- If DataLoader workers cause issues on macOS, override with `num_workers=0` via CLI.
+- Set `export PROJECT_ROOT=$(pwd)` if config cannot resolve project root (usually auto‑detected).
+
 ### Bibliography
 
 ```shell
@@ -38,5 +58,4 @@ python3 src/main.py model=GLORY dataset=MINDsmall reprocess=True
       publisher ={RecSys},
 }
 ```
-
 

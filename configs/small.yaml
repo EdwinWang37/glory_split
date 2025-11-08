@@ -5,7 +5,7 @@
 defaults:
   - default
   - override dataset: MINDsmall
-  - override model: GLORY
+  - override model: GLORYSplit
   - _self_
 
 optimizer:
@@ -31,10 +31,12 @@ model:
   directed: true
   num_neighbors: 8
   k_hops: 2
-  
+  news_encoder_path: checkpoint/GLORY_MINDsmall_default_auc0.6760649681091309.pth
+
+
 
 logger:
-  exp_name: GLORY
+  exp_name: GLORYSplit
   run_name: ${model.model_name}_${dataset.dataset_name}_${model.k_hops}-${model.num_neighbors}-${model.entity_neighbors}
 
 ml_label: default
@@ -48,3 +50,4 @@ log_steps: 1000
 
 val_skip_epochs: 2
 val_steps: 1000
+device: cuda

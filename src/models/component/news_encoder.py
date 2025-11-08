@@ -28,7 +28,16 @@ class NewsEncoder(nn.Module):
             self.word_encoder = nn.Embedding(glove_emb+1, 300, padding_idx=0)
             nn.init.uniform_(self.word_encoder.weight, -1.0, 1.0)
 
-        self.view_size = [cfg.model.title_size, cfg.model.abstract_size]
+        # Gracefully handle minimal cfgs that omit title/abstract sizes (e.g., unit tests)
+        try:
+            title_size = int(cfg.model.title_size)
+        except Exception:
+            title_size = 30
+        try:
+            abstract_size = int(cfg.model.abstract_size)
+        except Exception:
+            abstract_size = 25
+        self.view_size = [title_size, abstract_size]
         
 
         self.attention = Sequential('x, mask', [

@@ -14,8 +14,10 @@ venv
 data/
 log/
 checkpoint/
-runs/
-multirun/
 outputs/
 pred/
 mlruns/
+train/.pytest_cache/
+.coverage
+htmlcov/
+.pytest_cache/

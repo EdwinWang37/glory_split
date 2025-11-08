@@ -1,0 +1,7 @@
+defaults:
+  - default
+  - _self_
+
+model_name : GLORYSplit
+use_graph: true
+news_encoder_path: checkpoint/GLORY_MINDsmall_default_auc0.6760649681091309.pth
